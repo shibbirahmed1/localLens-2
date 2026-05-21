@@ -79,6 +79,82 @@
 
 ---
 
+## Slide 5A — Request Lifecycle: file-by-file call chain
+
+**Slide content**
+- One `POST /search` flows: browser → API → orchestrator → 7 agent stages (each calling its data-source / NLP / LLM files) → events streamed back over SSE.
+
+```mermaid
+flowchart TD
+    UI["web/app.js<br/>POST /search (SSE)"]
+    ROUTE["api/routes.py<br/>post_search()"]
+    ORCH["pipeline/orchestrator.py<br/>run() — sequential await"]
+
+    UI --> ROUTE
+    ROUTE -. "cache hit" .-> CACHE["cache/disk_cache.py<br/>DiskCacheClient.get()"]
+    ROUTE -. "prior turns" .-> CHATR["chat/store.py<br/>get_chat()"]
+    ROUTE -->|"cache miss → spawn task"| ORCH
+
+    ORCH --> A["_run_intent_stage()"]
+    A --> AP["agents/intent_parser.py<br/>IntentParser.parse()"]
+    AP --> APL["llm/factory.py<br/>get_llm_provider().complete()"]
+    AP --> APC["nlp/intent_classifier.py<br/>predict() cross-check"]
+
+    A --> B["_run_location_stage()"]
+    B --> BP["agents/location_resolver.py<br/>resolve()"]
+    BP --> BPi["data_sources/ip_geolocation.py"]
+    BP --> BPn["data_sources/nominatim.py"]
+
+    B --> C["_run_search_stage()"]
+    C --> CP["agents/search_agent.py<br/>find_businesses()"]
+    CP --> Cov["data_sources/overpass.py"]
+    CP --> Cddg["data_sources/duckduckgo.py"]
+    CP --> Cbing["data_sources/bing_playwright.py"]
+    CP --> Cg["data_sources/google_playwright.py"]
+    CP --> Cmaps["data_sources/google_maps_playwright.py"]
+    CP --> Clist["agents/listicle_expander.py"]
+    CP --> Crel["agents/relevance_filter.py"]
+    CP --> Ccat["agents/category_autotagger.py"]
+
+    C --> D["_run_review_stage()"]
+    D --> DP["agents/review_aggregator.py<br/>enrich()"]
+    DP --> DPs["data_sources/web_scraper.py"]
+    DP --> DPsent["nlp/sentiment_analyzer.py"]
+    DP --> DPt["nlp/theme_extractor.py"]
+
+    D --> E["_run_scoring_stage()"]
+    E --> Esem["agents/semantic_matcher.py<br/>score()"]
+    E --> Escore["agents/scoring_engine.py<br/>rank_all_candidates()"]
+    E --> Eval["agents/place_validator.py<br/>validate()"]
+
+    E --> F["_run_summary_stage()"]
+    F --> FP["agents/summary_generator.py<br/>summarize()"]
+    FP --> FPL["llm/factory.py<br/>complete() + verify_grounding()"]
+
+    F --> G["_run_formatting_stage()"]
+    G --> GP["agents/response_formatter.py<br/>format_response()"]
+    GP --> SAVE["cache set + chat/store.py<br/>append_message()"]
+
+    A -. emit .-> EV["pipeline/events.py<br/>PipelineEventEmitter"]
+    B -. emit .-> EV
+    C -. emit .-> EV
+    D -. emit .-> EV
+    E -. emit .-> EV
+    F -. emit .-> EV
+    G -. emit .-> EV
+    EV --> STREAM["api/streaming.py<br/>merge_pipeline_with_final_response()"]
+    STREAM -->|"SSE: pipeline_event / final_response"| UI
+```
+
+**Talking points**
+- "Entry point is `web/app.js` POSTing to `/search`. `api/routes.py::post_search` checks the disk cache, loads recent chat turns for memory, then spawns `orchestrator.run()` as a background task and immediately starts streaming."
+- "`orchestrator.py::run` doesn't fan out — it `await`s the seven `_run_*` stage methods **in order**. Each one calls exactly one agent: intent_parser → location_resolver → search_agent → review_aggregator → (semantic_matcher + scoring_engine + place_validator) → summary_generator → response_formatter."
+- "The two LLM touch points are `intent_parser` and `summary_generator`, both via `llm/factory.py` (Ollama or Groq). The search agent is the wide one — it calls all the `data_sources/*` clients concurrently. The review aggregator calls `web_scraper` + the two `nlp/` models."
+- "After every stage, the method emits a `PipelineEvent` to `pipeline/events.py`; `api/streaming.py` merges those onto the SSE stream so `web/app.js` renders the timeline live. The final `format_response()` output is cached and appended to `chat/store.py`, then sent as the `final_response` event."
+- "One branch not shown for clarity: if the intent parser returns low confidence, `run()` short-circuits straight to a clarification response and skips stages B–G."
+
+---
+
 ## Slide 6 — Stage Walkthrough (A–D)
 
 **Slide content**
